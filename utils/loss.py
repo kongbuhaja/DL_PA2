@@ -165,7 +165,7 @@ class ComputeLoss:
 
                 # If prediction is matched (iou > 0.5) with bounding box marked as ignore,
                 # do not calculate objectness loss
-                ign_idx = (tcls[i] == -1) & (iou > self.hyp["iou_t"])
+                ign_idx = ((tcls[i] == 2 )| (tcls[i] == -1)) & (iou > self.hyp["iou_t"])
                 keep = ~ign_idx
                 b, a, gj, gi, iou = b[keep], a[keep], gj[keep], gi[keep], iou[keep]
 

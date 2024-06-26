@@ -12,10 +12,16 @@ import torch
 from utils import TryExcept, threaded
 
 
-def fitness(x):
+def fitness(x, typ='map'):
     """Calculates fitness of a model using weighted sum of metrics P, R, mAP@0.5, mAP@0.5:0.95."""
-    w = [0.0, 0.0, 0.1, 0.9]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
-    return (x[:, :4] * w).sum(1)
+    x[:, 4] = 1 - x[:, 4]
+    if typ=='map':
+        w = [0.0, 0.0, 0.1, 0.9, 0.0] 
+    elif typ=='mr':
+        w = [0.0, 0.0, 0.0, 0.0, 1.0]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
+    elif typ=='hybrid':
+        w = [0.0, 0.0, 0.0, 0.5, 0.5]
+    return (x[:, :5] * w).sum(1)
 
 
 def smooth(y, f=0.05):

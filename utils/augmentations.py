@@ -240,6 +240,99 @@ def random_perspective(
 
     return im, targets
 
+def get_aug_param(im, degrees=10, translate=0.1, scale=0.1, shear=10, perspective=0.0, border=(0, 0)):
+    height = im.shape[0] + border[0] * 2  # shape(h,w,c)
+    width = im.shape[1] + border[1] * 2
+
+    # Center
+    C = np.eye(3)
+    C[0, 2] = -im.shape[1] / 2  # x translation (pixels)
+    C[1, 2] = -im.shape[0] / 2  # y translation (pixels)
+
+    # Perspective
+    P = np.eye(3)
+    P[2, 0] = random.uniform(-perspective, perspective)  # x perspective (about y)
+    P[2, 1] = random.uniform(-perspective, perspective)  # y perspective (about x)
+
+    # Rotation and Scale
+    R = np.eye(3)
+    a = random.uniform(-degrees, degrees)
+    # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
+    s = random.uniform(1 - scale, 1 + scale)
+    # s = 2 ** random.uniform(-scale, scale)
+    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
+
+    # Shear
+    S = np.eye(3)
+    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
+    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
+
+    # Translation
+    T = np.eye(3)
+    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
+    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
+
+    # Combined rotation matrix
+    M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
+    return M, perspective, s, border
+
+def perspective_transform(
+    im, targets=(), segments=(), M=np.eye(3), perspective=0.0, s=1.0, border=(0,0)
+):
+    # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(0.1, 0.1), scale=(0.9, 1.1), shear=(-10, 10))
+    # targets = [cls, xyxy]
+    height = im.shape[0] + border[0] * 2  # shape(h,w,c)
+    width = im.shape[1] + border[1] * 2
+    
+    if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
+        if perspective:
+            im = cv2.warpPerspective(im, M, dsize=(width, height), borderValue=(114, 114, 114))
+        else:  # affine
+            im = cv2.warpAffine(im, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+
+    # Visualize
+    # import matplotlib.pyplot as plt
+    # ax = plt.subplots(1, 2, figsize=(12, 6))[1].ravel()
+    # ax[0].imshow(im[:, :, ::-1])  # base
+    # ax[1].imshow(im2[:, :, ::-1])  # warped
+
+    # Transform label coordinates
+    n = len(targets)
+    if n:
+        use_segments = any(x.any() for x in segments) and len(segments) == n
+        new = np.zeros((n, 4))
+        if use_segments:  # warp segments
+            segments = resample_segments(segments)  # upsample
+            for i, segment in enumerate(segments):
+                xy = np.ones((len(segment), 3))
+                xy[:, :2] = segment
+                xy = xy @ M.T  # transform
+                xy = xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]  # perspective rescale or affine
+
+                # clip
+                new[i] = segment2box(xy, width, height)
+
+        else:  # warp boxes
+            xy = np.ones((n * 4, 3))
+            xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
+            xy = xy @ M.T  # transform
+            xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)  # perspective rescale or affine
+
+            # create new boxes
+            x = xy[:, [0, 2, 4, 6]]
+            y = xy[:, [1, 3, 5, 7]]
+            new = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+
+            # clip
+            new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
+            new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
+
+        # filter candidates
+        i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
+        targets = targets[i]
+        targets[:, 1:5] = new[i]
+
+    return im, targets
 
 def copy_paste(im, labels, segments, p=0.5):
     """
@@ -266,6 +359,32 @@ def copy_paste(im, labels, segments, p=0.5):
 
     return im, labels, segments
 
+def copy_paste_rgbt(imgs, labels, segments, p=0.5):
+    """
+    Applies Copy-Paste augmentation by flipping and merging segments and labels on an image.
+
+    Details at https://arxiv.org/abs/2012.07177.
+    """
+    n = len(segments)
+    if p and n:
+        r = random.sample(range(n), k=round(p*n))
+        for ii, img in enumerate(imgs):
+            h, w, c = img.shape  # height, width, channels
+            im_new = np.zeros(img.shape, np.uint8)
+            for j in r:
+                l, s = labels[j], segments[j]
+                box = w - l[3], l[2], w - l[1], l[4]
+                ioa = bbox_ioa(box, labels[:, 1:5])  # intersection over area
+                if (ioa < 0.30).all():  # allow 30% obscuration of existing labels
+                    labels = np.concatenate((labels, [[l[0], *box]]), 0)
+                    segments.append(np.concatenate((w - s[:, 0:1], s[:, 1:2]), 1))
+                    cv2.drawContours(im_new, [segments[j].astype(np.int32)], -1, (1, 1, 1), cv2.FILLED)
+
+            result = cv2.flip(img, 1)  # augment segments (flip left-right)
+            i = cv2.flip(im_new, 1).astype(bool)
+            imgs[ii][i] = result[i]  # cv2.imwrite('debug.jpg', im)  # debug
+
+    return imgs, labels, segments
 
 def cutout(im, labels, p=0.5):
     """
@@ -308,6 +427,19 @@ def mixup(im, labels, im2, labels2):
     im = (im * r + im2 * (1 - r)).astype(np.uint8)
     labels = np.concatenate((labels, labels2), 0)
     return im, labels
+
+def mixup_rgbt(imgs, labels, imgs2, labels2):
+    """
+    Applies MixUp augmentation by blending images and labels.
+
+    See https://arxiv.org/pdf/1710.09412.pdf for details.
+    """
+    r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
+    img_iwir = (imgs[0] * r + imgs2[0] * (1 - r)).astype(np.uint8)
+    img_vis = (imgs[1] * r + imgs2[0] * (1 - r)).astype(np.uint8)
+    imgs = [img_iwir, img_vis]
+    labels = np.concatenate((labels, labels2), 0)
+    return imgs, labels
 
 
 def box_candidates(box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):

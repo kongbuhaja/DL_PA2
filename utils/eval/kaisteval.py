@@ -22,8 +22,12 @@ import traceback
 # from matplotlib.patches import Polygon
 import matplotlib.pyplot as plt
 
-from coco import COCO
-from cocoeval import COCOeval, Params
+if __name__ == "__main__":
+    from coco import COCO
+    from cocoeval import COCOeval, Params
+else:
+    from utils.eval.coco import COCO
+    from utils.eval.cocoeval import COCOeval, Params
 
 font = {'size': 22}
 matplotlib.rc('font', **font)
@@ -553,7 +557,7 @@ class KAISTPedEval(COCOeval):
 
 
 
-def evaluate(test_annotation_file: str, user_submission_file: str, phase_codename: str = 'Multispectral'):
+def evaluate(test_annotation_file: str, user_submission_file: str, phase_codename: str = ''):
     """Evaluates the submission for a particular challenge phase and returns score
 
     Parameters
@@ -642,6 +646,8 @@ def evaluate(test_annotation_file: str, user_submission_file: str, phase_codenam
     #     # + f'recall_all: {recall_all * 100:.2f}\n' \
     # print(msg)
 
+    if phase_codename == 'Multispectral':
+        return eval_result
     return metrics
     # return eval_result
 
@@ -660,7 +666,7 @@ def draw_all(eval_results, filename='figure.jpg'):
     fig, axes = plt.subplots(1, 3, figsize=(45, 10))
 
     methods = [res['all'].method for res in eval_results]
-    colors = [plt.cm.get_cmap('Paired')(ii)[:3] for ii in range(len(eval_results))]
+    colors = [plt.colormaps.get_cmap('Paired')(ii)[:3] for ii in range(len(eval_results))]
 
     eval_results_all = [res['all'].eval for res in eval_results]
     KAISTPedEval.draw_figure(axes[0], eval_results_all, methods, colors)
@@ -692,5 +698,5 @@ if __name__ == "__main__":
     results = [evaluate(args.annFile, rstFile, phase) for rstFile in args.rstFiles]
 
     # Sort results by MR_all
-    # results = sorted(results, key=lambda x: x['all'].summarize(0), reverse=True)
-    # draw_all(results, filename=args.evalFig)
+    results = sorted(results, key=lambda x: np.mean(x['all'].summarize(0)), reverse=True)
+    draw_all(results, filename=args.evalFig)

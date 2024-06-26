@@ -90,6 +90,9 @@ class Loggers:
             "metrics/recall",
             "metrics/mAP_0.5",
             "metrics/mAP_0.5:0.95",  # metrics
+            "metrics/MR_All",
+            "metrics/MR_Day",
+            "metrics/MR_Night",
             "val/box_loss",
             "val/obj_loss",
             "val/cls_loss",  # val loss
@@ -97,7 +100,14 @@ class Loggers:
             "x/lr1",
             "x/lr2",
         ]  # params
-        self.best_keys = ["best/epoch", "best/precision", "best/recall", "best/mAP_0.5", "best/mAP_0.5:0.95"]
+        self.best_keys = ["best/epoch", 
+                          "best/precision", 
+                          "best/recall", 
+                          "best/mAP_0.5", 
+                          "best/mAP_0.5:0.95", 
+                          "best/MR_ALL", 
+                          "best/MR_Day", 
+                          "best/MR_Night"]
         for k in LOGGERS:
             setattr(self, k, None)  # init empty logger dictionary
         self.csv = True  # always log to csv
@@ -199,8 +209,8 @@ class Loggers:
                     log_tensorboard_graph(self.tb, model, imgsz=(self.opt.imgsz, self.opt.imgsz))
             if ni == 10 and (self.wandb or self.clearml):
                 files = sorted(self.save_dir.glob("train*.jpg"))
-                if self.wandb:
-                    self.wandb.log({"Mosaics": [wandb.Image(str(f), caption=f.name) for f in files if f.exists()]})
+                # if self.wandb:
+                    # self.wandb.log({"Mosaics": [wandb.Image(str(f), caption=f.name) for f in files if f.exists()]})
                 if self.clearml:
                     self.clearml.log_debug_samples(files, title="Mosaics")
 
@@ -236,8 +246,8 @@ class Loggers:
         """Logs validation results to WandB or ClearML at the end of the validation process."""
         if self.wandb or self.clearml:
             files = sorted(self.save_dir.glob("val*.jpg"))
-        if self.wandb:
-            self.wandb.log({"Validation": [wandb.Image(str(f), caption=f.name) for f in files]})
+        # if self.wandb:
+            # self.wandb.log({"Validation": [wandb.Image(str(f), caption=f.name) for f in files]})
         if self.clearml:
             self.clearml.log_debug_samples(files, title="Validation")
 
@@ -270,7 +280,7 @@ class Loggers:
 
         if self.wandb:
             if best_fitness == fi:
-                best_results = [epoch] + vals[3:7]
+                best_results = [epoch] + vals[3:10]
                 for i, name in enumerate(self.best_keys):
                     self.wandb.wandb_run.summary[name] = best_results[i]  # log best results in the summary
             self.wandb.log(x)
@@ -309,7 +319,7 @@ class Loggers:
                 self.tb.add_image(f.stem, cv2.imread(str(f))[..., ::-1], epoch, dataformats="HWC")
 
         if self.wandb:
-            self.wandb.log(dict(zip(self.keys[3:10], results)))
+            self.wandb.log(dict(zip(self.keys[3:13], results)))
             self.wandb.log({"Results": [wandb.Image(str(f), caption=f.name) for f in files]})
             # Calling wandb.log. TODO: Refactor this into WandbLogger.log_model
             if not self.opt.evolve:

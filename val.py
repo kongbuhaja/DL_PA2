@@ -60,6 +60,7 @@ from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
+from utils.eval.kaisteval import evaluate
 
 def save_one_txt(predn, save_conf, shape, file):
     """Saves one detection result to a txt file in normalized xywh format, optionally including confidence."""
@@ -80,9 +81,11 @@ def save_one_json(predn, jdict, path, index, class_map):
     image_id = int(path.stem) if path.stem.isnumeric() else path.stem
     box = xyxy2xywh(predn[:, :4])  # xywh
     box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+    
     for p, b in zip(predn.tolist(), box.tolist()):
         if p[4] < 0.1:
             continue
+        
         jdict.append(
             {
                 "image_name": image_id,
@@ -92,7 +95,6 @@ def save_one_json(predn, jdict, path, index, class_map):
                 "score": round(p[4], 5),
             }
         )
-
 
 def process_batch(detections, labels, iouv):
     """
@@ -138,7 +140,7 @@ def run(
     save_txt=False,  # save results to *.txt
     save_hybrid=False,  # save label+prediction hybrid results to *.txt
     save_conf=False,  # save confidences in --save-txt labels
-    save_json=False,  # save a COCO-JSON results file
+    save_json=True,  # save a COCO-JSON results file
     project=ROOT / "runs/val",  # save to project/name
     name="exp",  # save to project/name
     exist_ok=False,  # existing project/name ok, do not increment
@@ -151,6 +153,7 @@ def run(
     callbacks=Callbacks(),
     compute_loss=None,
     epoch=None,
+    rgbt=None,
 ):
     # Initialize/load model and set device
     training = model is not None
@@ -197,19 +200,20 @@ def run(
                 f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
                 f"classes). Pass correct combination of --weights and --data that are trained together."
             )
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
+        # model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
         pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
         task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
         dataloader = create_dataloader(
             data[task],
             imgsz,
-            batch_size,
+            batch_size*2,
             stride,
             single_cls,
             pad=pad,
-            rect=rect,
+            rect=False,
             workers=workers,
             prefix=colorstr(f"{task}: "),
+            rgbt_input=rgbt
         )[0]
 
     seen = 0
@@ -220,12 +224,13 @@ def run(
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
     s = ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "P", "R", "mAP50", "mAP50-95")
     tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    MR_all, MR_day, MR_night = 1.0, 1.0, 1.0
     dt = Profile(device=device), Profile(device=device), Profile(device=device)  # profiling times
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run("on_val_start")
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
-
+    
     for batch_i, (ims, targets, paths, shapes, indices) in enumerate(pbar):
         callbacks.run("on_val_batch_start")
         with dt[0]:
@@ -309,6 +314,7 @@ def run(
 
         callbacks.run("on_val_batch_end", batch_i, ims, targets, paths, shapes, preds)
 
+
     # Compute metrics
     stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
@@ -348,7 +354,7 @@ def run(
         if weights:
             w = Path(weights[0] if isinstance(weights, list) else weights).stem
         else:
-            w = f'epoch{epoch}'
+            w = f'epoch{epoch}' if epoch is not None else f'_{save_json}'
 
         pred_json = str(save_dir / f"{w}_predictions.json")  # predictions
         LOGGER.info(f"\nSaving {pred_json}...")
@@ -363,30 +369,32 @@ def run(
             # HACK: need to generate KAIST_annotation.json for your own validation set
             if not os.path.exists('utils/eval/KAIST_annotation.json'):
                 raise FileNotFoundError('Please generate KAIST_annotation.json for your own validation set.')
-            os.system(f"python3 utils/eval/kaisteval.py --annFile utils/eval/KAIST_annotation.json --rstFile {pred_json}")
+            # os.system(f"python3 utils/eval/kaisteval.py --annFile utils/eval/KAIST_annotation.json --rstFile {pred_json}")
+            MR_result = evaluate('utils/eval/KAIST_annotation.json', f'{pred_json}')
+            MR_all, MR_day, MR_night = MR_result['MR_-2_iou50_all'], MR_result['MR_-2_iou50_day'], MR_result['MR_-2_iou50_night']
         except Exception as e:
             LOGGER.info(f"kaisteval unable to run: {e}")
 
         # Run evaluation: MSCOCO Dataset
-        anno_json = str(Path("../datasets/coco/annotations/instances_val2017.json"))  # annotations
-        if not os.path.exists(anno_json):
-            anno_json = os.path.join(data["path"], "annotations", "instances_val2017.json")
-        try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-            check_requirements("pycocotools>=2.0.6")
-            from pycocotools.coco import COCO
-            from pycocotools.cocoeval import COCOeval
+        # anno_json = str(Path("../datasets/coco/annotations/instances_val2017.json"))  # annotations
+        # if not os.path.exists(anno_json):
+        #     anno_json = os.path.join(data["path"], "annotations", "instances_val2017.json")
+        # try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
+        #     check_requirements("pycocotools>=2.0.6")
+        #     from pycocotools.coco import COCO
+        #     from pycocotools.cocoeval import COCOeval
 
-            anno = COCO(anno_json)  # init annotations api
-            pred = anno.loadRes(pred_json)  # init predictions api
-            eval = COCOeval(anno, pred, "bbox")
-            if is_coco:
-                eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.im_files]  # image IDs to evaluate
-            eval.evaluate()
-            eval.accumulate()
-            eval.summarize()
-            map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
-        except Exception as e:
-            LOGGER.info(f"pycocotools unable to run: {e}")
+        #     anno = COCO(anno_json)  # init annotations api
+        #     pred = anno.loadRes(pred_json)  # init predictions api
+        #     eval = COCOeval(anno, pred, "bbox")
+        #     if is_coco:
+        #         eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.im_files]  # image IDs to evaluate
+        #     eval.evaluate()
+        #     eval.accumulate()
+        #     eval.summarize()
+        #     map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
+        # except Exception as e:
+        #     LOGGER.info(f"pycocotools unable to run: {e}")
 
     # Return results
     model.float()  # for training
@@ -396,20 +404,20 @@ def run(
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+    return (mp, mr, map50, map, MR_all, MR_day, MR_night, *(loss.cpu() / len(dataloader)).tolist()), maps, t
 
 
 def parse_opt():
     """Parses command-line options for YOLOv5 model inference configuration."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
-    parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov5s.pt", help="model path(s)")
+    parser.add_argument("--data", type=str, default=ROOT / "data/kaist-rgbt.yaml", help="dataset.yaml path")
+    parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov5n.pt", help="model path(s)")
     parser.add_argument("--batch-size", type=int, default=32, help="batch size")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="inference size (pixels)")
     parser.add_argument("--conf-thres", type=float, default=0.001, help="confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=0.6, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=300, help="maximum detections per image")
-    parser.add_argument("--task", default="val", help="train, val, test, speed or study")
+    parser.add_argument("--task", default="test", help="train, val, test, speed or study")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
     parser.add_argument("--single-cls", action="store_true", help="treat as single-class dataset")
@@ -424,9 +432,11 @@ def parse_opt():
     parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
+    parser.add_argument("--rgbt", action="store_true", help="Feed RGB-T multispectral image pair.")
+
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
-    opt.save_json |= opt.data.endswith("coco.yaml")
+    # opt.save_json |= opt.data.endswith("coco.yaml")
     opt.save_txt |= opt.save_hybrid
     print_args(vars(opt))
     return opt

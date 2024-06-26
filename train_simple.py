@@ -100,7 +100,7 @@ def train(hyp, opt, device, callbacks):
     # Directories
     w = save_dir / "weights"  # weights dir
     w.mkdir(parents=True, exist_ok=True)  # make dir
-    last, best = w / "last.pt", w / "best.pt"
+    last, ap_best, mr_best, hybrid_best = w / "last.pt", w / "ap_best.pt", w / "mr_best.pt", w / "hybrid_best.pt"
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -133,7 +133,7 @@ def train(hyp, opt, device, callbacks):
     # Config
     init_seeds(opt.seed, deterministic=True)
     data_dict = data_dict or check_dataset(data)  # check if None
-    train_path, val_path = data_dict["train"], data_dict["val"]
+    train_path, val_path, test_path = data_dict["train"], data_dict["val"], data_dict["test"]
     nc = 1 if single_cls else int(data_dict["nc"])  # number of classes
     names = {0: data_dict["names"][0]} if single_cls and len(data_dict["names"]) != 1 else data_dict["names"]  # class names
 
@@ -176,7 +176,7 @@ def train(hyp, opt, device, callbacks):
     ema = ModelEMA(model)
 
     # Resume
-    best_fitness, start_epoch = 0.0, 0
+    ap_best_fitness, mr_best_fitness, hybrid_best_fitness, start_epoch = 0.0, 0.0, 0.0, 0
 
     # Trainloader
     train_loader, dataset = create_dataloader(
@@ -186,9 +186,9 @@ def train(hyp, opt, device, callbacks):
         gs,
         single_cls,
         hyp=hyp,
-        augment=False,      # TODO: make it work
+        augment=True,      # TODO: make it work
         cache=None if opt.cache == "val" else opt.cache,
-        rect=opt.rect,
+        rect=False,
         rank=-1,
         workers=workers,
         image_weights=False,
@@ -216,6 +216,20 @@ def train(hyp, opt, device, callbacks):
         workers=workers,
         pad=0.5,
         prefix=colorstr("val: "),
+        rgbt_input=opt.rgbt,
+    )[0]
+
+    # Tester
+    test_loader = create_dataloader(
+        test_path,
+        imgsz,
+        1,
+        gs,
+        single_cls,
+        cache=opt.cache,
+        rect=False,
+        workers=workers,
+        prefix=colorstr("test: "),
         rgbt_input=opt.rgbt,
     )[0]
 
@@ -344,10 +358,24 @@ def train(hyp, opt, device, callbacks):
             )
 
         # Update best mAP
-        fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+        ap_fi = fitness(np.array(results).reshape(1, -1), 'map')  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+        mr_fi = fitness(np.array(results).reshape(1, -1), 'mr')
+        hybrid_fi = fitness(np.array(results).reshape(1, -1), 'hybrid')
+        if ap_fi > ap_best_fitness:
+            ap_best_fitness = ap_fi
+        if mr_fi > mr_best_fitness:
+            mr_best_fitness = mr_fi
+        if hybrid_fi > hybrid_best_fitness:
+            hybrid_best_fitness = hybrid_fi
+
+        fi, best, best_fitness = (ap_fi, ap_best, ap_best_fitness) if opt.metric == 'map' else \
+                                 (mr_fi, mr_best, mr_best_fitness) if opt.metric == 'mr' else \
+                                 (hybrid_fi, hybrid_best, hybrid_best_fitness)
+        
         stop = stopper(epoch=epoch, fitness=fi)  # early stop check
-        if fi > best_fitness:
-            best_fitness = fi
+        # if fi > best_fitness:
+        #     best_fitness = fi
+
         log_vals = list(mloss) + list(results) + lr
         callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
 
@@ -367,10 +395,21 @@ def train(hyp, opt, device, callbacks):
 
             # Save last, best and delete
             torch.save(ckpt, last)
-            if best_fitness == fi:
-                torch.save(ckpt, best)
+            # if best_fitness == fi:
+            #     torch.save(ckpt, best)
             if opt.save_period > 0 and epoch % opt.save_period == 0:
                 torch.save(ckpt, w / f"epoch{epoch}.pt")
+            
+            if ap_best_fitness == ap_fi:
+                ckpt['best_fitness'] = ap_fi
+                torch.save(ckpt, ap_best)
+            if mr_best_fitness == mr_fi:
+                ckpt['best_fitness'] = mr_fi
+                torch.save(ckpt, mr_best)
+            if hybrid_best_fitness == hybrid_fi:
+                ckpt['best_fitness'] = hybrid_fi
+                torch.save(ckpt, hybrid_best)
+
             del ckpt
             callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
 
@@ -382,10 +421,11 @@ def train(hyp, opt, device, callbacks):
 
     # end training -----------------------------------------------------------------------------------------------------
     LOGGER.info(f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.")
-    for f in last, best:
+    for f, mn in [(last, 'last'), (ap_best, 'ap_best'), (mr_best, 'mr_best'), (hybrid_best, 'hybrid_best')]:
         if f.exists():
             strip_optimizer(f)  # strip optimizers
-            if f is best:
+            if f in [ap_best, mr_best, hybrid_best]:
+            # if f is best:
                 LOGGER.info(f"\nValidating {f}...")
                 results, _, _ = validate.run(
                     data_dict,
@@ -394,9 +434,9 @@ def train(hyp, opt, device, callbacks):
                     model=attempt_load(f, device).half(),
                     iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
                     single_cls=single_cls,
-                    dataloader=val_loader,
+                    dataloader=test_loader,
                     save_dir=save_dir,
-                    save_json=True,
+                    save_json=mn,
                     verbose=True,
                     plots=False,
                     callbacks=callbacks,
@@ -416,8 +456,8 @@ def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
     parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
-    parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
+    parser.add_argument("--data", type=str, default=ROOT / "data/kaist-rgbt.yaml", help="dataset.yaml path")
+    parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-high.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
@@ -453,6 +493,7 @@ def parse_opt(known=False):
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
     parser.add_argument("--rgbt", action="store_true", help="Feed RGB-T multispectral image pair.")
+    parser.add_argument("--metric", type=str, default=0, choices=['map', 'mr', 'hybrid'], help="metric for best model")
 
     # Logger arguments
     parser.add_argument("--entity", default=None, help="Entity")
